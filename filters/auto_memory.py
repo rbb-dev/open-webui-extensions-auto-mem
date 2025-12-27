@@ -688,6 +688,26 @@ class Filter:
             raise ValueError("no JSON object found in model response")
         return text[start : end + 1]
 
+    def _log_background_task_result(
+        self, task: "asyncio.Task[object]", *, user_id: str, chat_id: str
+    ) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            self.log(
+                f"Auto Memory: failed to read background task result (user_id={user_id}, chat_id={chat_id}): {e}",
+                level="error",
+            )
+            return
+
+        if exc is not None:
+            self.log(
+                f"Auto Memory: background task failed (user_id={user_id}, chat_id={chat_id}): {exc}",
+                level="error",
+            )
+
     def _task_model_candidates(
         self, request: Request, chat_model_id: Optional[str]
     ) -> list[str]:
@@ -1260,7 +1280,7 @@ class Filter:
         if not chat_model_id and isinstance(__model__, dict):
             chat_model_id = __model__.get("id")
 
-        asyncio.create_task(
+        task = asyncio.create_task(
             self.auto_memory(
                 body.get("messages", []),
                 request=request,
@@ -1269,6 +1289,13 @@ class Filter:
                 emitter=__event_emitter__,
                 chat_model_id=cast(Optional[str], chat_model_id),
                 metadata=metadata if isinstance(metadata, dict) else None,
+            )
+        )
+        task.add_done_callback(
+            lambda t: self._log_background_task_result(
+                t,
+                user_id=str(user.id),
+                chat_id=str(chat_id),
             )
         )
 
