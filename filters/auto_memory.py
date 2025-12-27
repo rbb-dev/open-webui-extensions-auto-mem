@@ -648,6 +648,7 @@ class Filter:
             except Exception as e:
                 self.log(f"error stringifying message {i}: {e}", level="warning")
 
+        stringified_messages.reverse()
         return "\n".join(stringified_messages)
 
     def _schema_instructions_for(self, model: Type[BaseModel]) -> str:
