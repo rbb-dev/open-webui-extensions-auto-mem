@@ -516,7 +516,7 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
     memories = []
 
     if not results.ids or not results.documents or not results.metadatas:
-        raise ValueError("SearchResult must contain ids, documents, and metadatas")
+        return []
 
     for batch_idx, (ids_batch, docs_batch, metas_batch) in enumerate(
         zip(results.ids, results.documents, results.metadatas)
@@ -527,11 +527,9 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
             zip(ids_batch, docs_batch, metas_batch)
         ):
             if not meta:
-                raise ValueError(f"Missing metadata for memory id={mem_id}")
+                continue
             if "created_at" not in meta:
-                raise ValueError(
-                    f"Missing 'created_at' in metadata for memory id={mem_id}"
-                )
+                continue
             if "updated_at" not in meta:
                 # If updated_at is missing, default to created_at
                 meta["updated_at"] = meta["created_at"]
