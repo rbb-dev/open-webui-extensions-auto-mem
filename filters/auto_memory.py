@@ -1008,7 +1008,11 @@ class Filter:
         messages: list[dict[str, Any]],
         user: UserModel,
     ) -> list[Memory]:
-        memory_query = self.build_memory_query(messages)
+        try:
+            memory_query = self.build_memory_query(messages)
+        except ValueError as e:
+            self.log(f"skipping related memory lookup: {e}", level="warning")
+            return []
 
         # Query related memories
         try:
