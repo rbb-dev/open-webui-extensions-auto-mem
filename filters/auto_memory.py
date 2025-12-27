@@ -1140,7 +1140,7 @@ class Filter:
         actions = action_plan.actions
 
         # Show processing status
-        if emitter and len(actions) > 0:
+        if emitter and user_valves.show_status and len(actions) > 0:
             self.log(f"processing {len(actions)} memory actions", level="debug")
             await emit_status(
                 f"processing {len(actions)} memory actions",
