@@ -410,7 +410,7 @@ async def emit_status(
     extra_data: Optional[dict] = None,
 ):
     if not emitter:
-        raise ValueError("Emitter is required to emit status updates")
+        return
 
     await emitter(
         {
