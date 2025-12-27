@@ -967,22 +967,30 @@ class Filter:
         include_extra_context = user_word_count <= 8
 
         # Build query from most recent to older messages
-        # Add last assistant response (if exists)
-        if last_user_idx + 1 < len(messages):
-            last_assistant_msg = messages[last_user_idx + 1].get("content", "")
+        # Add the first assistant response after the last user message (if any)
+        last_assistant_msg = None
+        for idx in range(last_user_idx + 1, len(messages)):
+            if messages[idx].get("role") != "assistant":
+                continue
+            last_assistant_msg = messages[idx].get("content", "")
             if last_assistant_msg:
-                query_parts.append(f"Assistant: {last_assistant_msg}")
+                break
+        if last_assistant_msg:
+            query_parts.append(f"Assistant: {last_assistant_msg}")
 
         # Add last user message
         query_parts.append(f"User: {last_user_msg}")
 
-        # If short message, add previous assistant context
+        # If short message, add previous assistant context (nearest assistant before last user)
         if include_extra_context and last_user_idx > 0:
-            prev_assistant_msg = messages[last_user_idx - 1].get("content", "")
-            if (
-                prev_assistant_msg
-                and messages[last_user_idx - 1].get("role") == "assistant"
-            ):
+            prev_assistant_msg = None
+            for idx in range(last_user_idx - 1, -1, -1):
+                if messages[idx].get("role") != "assistant":
+                    continue
+                prev_assistant_msg = messages[idx].get("content", "")
+                if prev_assistant_msg:
+                    break
+            if prev_assistant_msg:
                 query_parts.append(f"Assistant: {prev_assistant_msg}")
 
         # Reverse to get chronological order and join
