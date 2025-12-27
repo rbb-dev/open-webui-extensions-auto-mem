@@ -688,6 +688,20 @@ class Filter:
             raise ValueError("no JSON object found in model response")
         return text[start : end + 1]
 
+    def _jsonable_metadata(self, metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if not isinstance(metadata, dict):
+            return {}
+        safe: dict[str, Any] = {}
+        for k, v in metadata.items():
+            if not isinstance(k, str):
+                continue
+            try:
+                json.dumps(v, ensure_ascii=False)
+            except Exception:
+                continue
+            safe[k] = v
+        return safe
+
     def _log_background_task_result(
         self, task: "asyncio.Task[object]", *, user_id: str, chat_id: str
     ) -> None:
@@ -767,7 +781,7 @@ class Filter:
                     "messages": messages,
                     "stream": False,
                     "metadata": {
-                        **(metadata if isinstance(metadata, dict) else {}),
+                        **self._jsonable_metadata(metadata),
                         "task": "auto_memory",
                     },
                 }
