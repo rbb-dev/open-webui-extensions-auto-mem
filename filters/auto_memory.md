@@ -34,7 +34,7 @@ You get:
 
 1. Make sure your Open WebUI is version `0.5.0` or newer
 2. Click on _GET_ to add the extension to your Open WebUI deployment
-3. Configure API keys and model (see below)
+3. Configure Task Model settings (see below)
 
 ---
 
@@ -44,13 +44,12 @@ Configure via the Open WebUI extension settings or directly in code:
 
 | Setting                       | Description                                                                                                                                                                                                                | Default                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| `openai_api_url`              | OpenAI-compatible API endpoint                                                                                                                                                                                             | `https://api.openai.com` |
-| `model`                       | LLM model for memory identification                                                                                                                                                                                        | `gpt-5-mini`             |
-| `api_key`                     | API key for the chosen endpoint                                                                                                                                                                                            | _(empty)_                |
+| `task_model_mode`             | Which Open WebUI global Task Model to use: `internal` uses `TASK_MODEL`, `external` uses `TASK_MODEL_EXTERNAL`                                                                                                             | `internal`               |
+| `task_model_fallback`         | Fallback if Task Model execution fails: `none`, `other_task_model` (switch internal/external), or `chat_model`                                                                                                            | `none`                   |
 | `related_memories_n`          | Number of related memories to check for consolidation                                                                                                                                                                      | `5`                      |
-| `related_memories_dist`       | Similarity distance threshold for related memories                                                                                                                                                                         | `0.75`                   |
+| `minimum_memory_similarity`   | Minimum similarity (0–1) required for a related memory to be considered for updates/deletes                                                                                                                                | _(unset)_                |
 | `messages_to_consider`        | How many recent messages to consider (user+assistant)                                                                                                                                                                      | `4`                      |
-| `allow_unsafe_user_overrides` | **SECURITY WARNING**: Allow users to override API URL/model without providing their own API key. This could allow users to steal your API key or use expensive models at your expense. Only enable if you trust all users. | `false`                  |
+| `override_memory_context`     | Intercept and override memory context injection in system prompts (lets you customise memory formatting)                                                                                                                   | `false`                  |
 | `debug_mode`                  | Enable detailed logging for troubleshooting                                                                                                                                                                                | `false`                  |
 
 ### User-Level Settings
@@ -61,12 +60,7 @@ Users can override settings individually:
 | ---------------------- | ---------------------------------------------- |
 | `enabled`              | Whether to enable Auto Memory for this user    |
 | `show_status`          | Display memory save status on UI               |
-| `openai_api_url`       | User-specific API endpoint (overrides global)  |
-| `model`                | User-specific model (overrides global)         |
-| `api_key`              | User-specific API key (overrides global)       |
 | `messages_to_consider` | User-specific message count (overrides global) |
-
-**Security Note**: User overrides for `openai_api_url` and `model` require the user to provide their own `api_key`. Without it, the admin's global settings are used for security. Admins can enable `allow_unsafe_user_overrides` to bypass this check, but this is not recommended.
 
 ---
 

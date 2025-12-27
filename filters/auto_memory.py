@@ -5,7 +5,7 @@ description: automatically identify and store valuable information from chats as
 author_email: nokodo@nokodo.net
 author_url: https://nokodo.net
 repository_url: https://nokodo.net/github/open-webui-extensions
-version: 1.2.0
+version: 1.3.0
 required_open_webui_version: >= 0.5.0
 funding_url: https://ko-fi.com/nokodo
 license: see extension documentation file `auto_memory.md` (License section) for the licensing terms.
@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import re
-import threading
 from datetime import datetime
 from typing import (
     Any,
@@ -27,7 +26,6 @@ from typing import (
     TypeVar,
     Union,
     cast,
-    overload,
 )
 
 from fastapi import HTTPException, Request
@@ -43,8 +41,8 @@ from open_webui.routers.memories import (
     query_memory,
     update_memory_by_id,
 )
-from openai import BadRequestError, OpenAI
-from pydantic import BaseModel, Field, create_model
+from open_webui.utils.chat import generate_chat_completion
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
@@ -558,37 +556,27 @@ def searchresults_to_memories(results: SearchResult) -> list[Memory]:
     return memories
 
 
-def _run_detached(coro):
-    """Helper to run coroutine in detached thread"""
-
-    def _runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-
-
 R = TypeVar("R", bound=BaseModel)
-ValveType = TypeVar("ValveType", str, int)
 
 
 class Filter:
     class Valves(BaseModel):
-        openai_api_url: str = Field(
-            default="https://api.openai.com/v1",
-            description="openai compatible endpoint",
+        model_config = ConfigDict(extra="ignore")
+
+        task_model_mode: Literal["internal", "external"] = Field(
+            default="internal",
+            description="Which global Task Model to use for Auto Memory. "
+            "'internal' uses Open WebUI TASK_MODEL, 'external' uses TASK_MODEL_EXTERNAL.",
         )
-        model: str = Field(
-            default="gpt-5-mini",
-            description="model to use to determine memory. an intelligent model is highly recommended, as it will be able to better understand the context of the conversation.",
-        )
-        api_key: str = Field(
-            default="", description="API key for OpenAI compatible endpoint"
+        task_model_fallback: Literal[
+            "none",
+            "other_task_model",
+            "chat_model",
+        ] = Field(
+            default="none",
+            description="Fallback strategy if Task Model execution fails. "
+            "'none' disables fallback, 'other_task_model' switches between internal/external, "
+            "'chat_model' uses the current chat model.",
         )
         messages_to_consider: int = Field(
             default=4,
@@ -604,10 +592,6 @@ class Filter:
             le=1.0,
             description="minimum similarity of memories to consider for updates. higher is more similar to user query. if not set, no filtering is applied.",
         )
-        allow_unsafe_user_overrides: bool = Field(
-            default=False,
-            description="SECURITY WARNING: allow users to override API URL/model without providing their own API key. this could allow users to steal your API key or use expensive models at your expense. only enable if you trust all users.",
-        )
         override_memory_context: bool = Field(
             default=False,
             description="intercept and override memory context injection in system prompts. when enabled, allows customization of how memories are presented to the model.",
@@ -618,23 +602,14 @@ class Filter:
         )
 
     class UserValves(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+
         enabled: bool = Field(
             default=True,
             description="whether to enable Auto Memory for this user",
         )
         show_status: bool = Field(
             default=True, description="show status of the action."
-        )
-        openai_api_url: Optional[str] = Field(
-            default=None,
-            description="user-specific openai compatible endpoint (overrides global)",
-        )
-        model: Optional[str] = Field(
-            default=None,
-            description="user-specific model to use (overrides global). an intelligent model is highly recommended, as it will be able to better understand the context of the conversation.",
-        )
-        api_key: Optional[str] = Field(
-            default=None, description="user-specific API key (overrides global)"
         )
         messages_to_consider: Optional[int] = Field(
             default=None,
@@ -653,13 +628,10 @@ class Filter:
     def messages_to_string(self, messages: list[dict[str, Any]]) -> str:
         stringified_messages: list[str] = []
 
-        effective_messages_to_consider = self.get_restricted_user_valve(
-            user_valve_value=self.user_valves.messages_to_consider,
-            admin_fallback=self.valves.messages_to_consider,
-            authorization_check=bool(
-                self.user_valves.api_key and self.user_valves.api_key.strip()
-            ),
-            valve_name="messages_to_consider",
+        effective_messages_to_consider = (
+            self.user_valves.messages_to_consider
+            if self.user_valves.messages_to_consider is not None
+            else self.valves.messages_to_consider
         )
 
         self.log(
@@ -684,166 +656,150 @@ class Filter:
 
         return "\n".join(stringified_messages)
 
-    @overload
-    async def query_openai_sdk(
+    def _schema_instructions_for(self, model: Type[BaseModel]) -> str:
+        schema_json = json.dumps(
+            model.model_json_schema(),
+            ensure_ascii=False,
+            indent=2,
+        )
+        return (
+            "Return ONLY valid JSON (no markdown, no code fences) that conforms to this JSON Schema. "
+            "Do not include any extra keys. If a field is unknown, omit it unless required.\n\n"
+            f"JSON Schema:\n{schema_json}"
+        )
+
+    def _strip_json_fences(self, text: str) -> str:
+        stripped = text.strip()
+
+        fenced = re.search(
+            r"```(?:json)?\s*([\s\S]*?)\s*```",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if fenced:
+            return fenced.group(1).strip()
+
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        if stripped.endswith("```"):
+            stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip()
+
+    def _extract_json_object(self, text: str) -> str:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("no JSON object found in model response")
+        return text[start : end + 1]
+
+    def _task_model_candidates(
+        self, request: Request, chat_model_id: Optional[str]
+    ) -> list[str]:
+        internal = getattr(request.app.state.config, "TASK_MODEL", "") or ""
+        external = getattr(request.app.state.config, "TASK_MODEL_EXTERNAL", "") or ""
+
+        primary = internal if self.valves.task_model_mode == "internal" else external
+        other = external if self.valves.task_model_mode == "internal" else internal
+
+        candidates: list[str] = []
+        for model_id in (primary.strip(),):
+            if model_id and model_id not in candidates:
+                candidates.append(model_id)
+
+        if self.valves.task_model_fallback == "other_task_model":
+            other = other.strip()
+            if other and other not in candidates:
+                candidates.append(other)
+        elif self.valves.task_model_fallback == "chat_model":
+            chat_model_id = (chat_model_id or "").strip()
+            if chat_model_id and chat_model_id not in candidates:
+                candidates.append(chat_model_id)
+
+        return candidates
+
+    async def query_task_model(
         self,
+        request: Request,
+        user: UserModel,
         system_prompt: str,
         user_message: str,
         response_model: Type[R],
-    ) -> R: ...
+        *,
+        chat_model_id: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> R:
+        response_model = cast(Type[R], response_model)
+        schema_instructions = self._schema_instructions_for(response_model)
 
-    @overload
-    async def query_openai_sdk(
-        self,
-        system_prompt: str,
-        user_message: str,
-        response_model: None = None,
-    ) -> str: ...
-
-    async def query_openai_sdk(
-        self,
-        system_prompt: str,
-        user_message: str,
-        response_model: Optional[Type[R]] = None,
-    ) -> Union[str, R]:
-        """Generic wrapper around OpenAI chat completions.
-
-        Behavior:
-        - If `response_model` is provided, attempts structured outputs first (SDK parse).
-        - If structured outputs are rejected as unsupported (Bad Request), falls back to a
-          normal completion that is explicitly instructed (with a JSON Schema) to return
-          valid JSON matching the schema, then parses the JSON (stripping ```json fences).
-        - If `response_model` is provided, this function returns a validated model instance
-          or raises (it never returns a raw string in that case).
-        - If `response_model` is not provided, returns raw text.
-        """
-
-        user_has_own_key = bool(
-            self.user_valves.api_key and self.user_valves.api_key.strip()
-        )
-
-        api_url = self.get_restricted_user_valve(
-            user_valve_value=self.user_valves.openai_api_url,
-            admin_fallback=self.valves.openai_api_url,
-            authorization_check=user_has_own_key,
-            valve_name="openai_api_url",
-        ).rstrip("/")
-
-        model_name = self.get_restricted_user_valve(
-            user_valve_value=self.user_valves.model,
-            admin_fallback=self.valves.model,
-            authorization_check=user_has_own_key,
-            valve_name="model",
-        )
-        api_key = self.user_valves.api_key or self.valves.api_key
-
-        if "gpt-5" in model_name:
-            temperature = 1.0
-            extra_args = {"reasoning_effort": "medium"}
-        else:
-            temperature = 0.3
-            extra_args = {}
-
-        client = OpenAI(api_key=api_key, base_url=api_url)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
+            {"role": "system", "content": schema_instructions},
             {"role": "user", "content": user_message},
         ]
 
-        def _strip_json_fences(text: str) -> str:
-            stripped = text.strip()
-
-            fenced = re.search(
-                r"```(?:json)?\s*([\s\S]*?)\s*```",
-                stripped,
-                flags=re.IGNORECASE,
-            )
-            if fenced:
-                return fenced.group(1).strip()
-
-            if stripped.startswith("```"):
-                stripped = re.sub(
-                    r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE
-                )
-            if stripped.endswith("```"):
-                stripped = re.sub(r"\s*```$", "", stripped)
-            return stripped.strip()
-
-        def _schema_instructions_for(model: Type[BaseModel]) -> str:
-            schema_json = json.dumps(
-                model.model_json_schema(),
-                ensure_ascii=False,
-                indent=2,
-            )
-            return (
-                "Return ONLY valid JSON (no markdown, no code fences) that conforms to this JSON Schema. "
-                "Do not include any extra keys. If a field is unknown, omit it unless required.\n\n"
-                f"JSON Schema:\n{schema_json}"
+        candidates = self._task_model_candidates(request, chat_model_id=chat_model_id)
+        if not candidates:
+            raise RuntimeError(
+                "no Task Model configured (TASK_MODEL/TASK_MODEL_EXTERNAL) and no fallback available"
             )
 
-        if response_model is None:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                **extra_args,  # pyright: ignore[reportArgumentType]
-            )
-            self.log(f"sdk response: {response}", level="debug")
+        last_error: Optional[Exception] = None
+        for model_id in candidates:
+            try:
+                payload: dict[str, Any] = {
+                    "model": model_id,
+                    "messages": messages,
+                    "stream": False,
+                    "metadata": {
+                        **(metadata if isinstance(metadata, dict) else {}),
+                        "task": "auto_memory",
+                    },
+                }
 
-            text_response = response.choices[0].message.content
-            if text_response is None:
-                raise ValueError(f"no text response from LLM. message={text_response}")
-
-            return text_response
-
-        response_model = cast(Type[R], response_model)
-        self.log(
-            f"attempting structured outputs with {response_model.__name__}",
-            level="debug",
-        )
-
-        try:
-            response = client.chat.completions.parse(
-                model=model_name,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                response_format=response_model,
-                **extra_args,  # pyright: ignore[reportArgumentType]
-            )
-
-            message = response.choices[0].message
-            if message.parsed is None:
-                raise ValueError(
-                    f"unable to parse structured response. message={message}"
+                self.log(
+                    f"Auto Memory: querying model '{model_id}' (mode={self.valves.task_model_mode}, fallback={self.valves.task_model_fallback})",
+                    level="debug",
                 )
 
-            return cast(R, message.parsed)
+                res = await generate_chat_completion(
+                    request=request, form_data=payload, user=user
+                )
 
-        except BadRequestError as e:
-            self.log(
-                f"structured outputs unsupported by API; falling back to schema-instructed JSON. error={e}",
-                level="warning",
-            )
+                if not isinstance(res, dict):
+                    raise TypeError(
+                        f"unexpected completion response type: {type(res).__name__}"
+                    )
 
-            fallback_messages: list[dict[str, str]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "system", "content": _schema_instructions_for(response_model)},
-                {"role": "user", "content": user_message},
-            ]
+                choices = res.get("choices", [])
+                if not choices:
+                    raise ValueError("no choices returned from model")
 
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=fallback_messages,  # type: ignore[arg-type]
-                temperature=temperature,
-                **extra_args,  # pyright: ignore[reportArgumentType]
-            )
+                message = choices[0].get("message", {}) or {}
+                text_response = (
+                    message.get("content")
+                    or message.get("reasoning_content")
+                    or res.get("content")
+                )
+                if not isinstance(text_response, str) or not text_response.strip():
+                    raise ValueError("no text response from model")
 
-            text_response = response.choices[0].message.content
-            if text_response is None:
-                raise ValueError(f"no text response from LLM. message={text_response}")
+                cleaned = self._strip_json_fences(text_response)
+                try:
+                    return cast(R, response_model.model_validate_json(cleaned))
+                except Exception:
+                    extracted = self._extract_json_object(cleaned)
+                    return cast(R, response_model.model_validate_json(extracted))
+            except Exception as e:
+                last_error = e
+                self.log(
+                    f"Auto Memory: model '{model_id}' failed: {e}",
+                    level="warning",
+                )
+                continue
 
-            cleaned = _strip_json_fences(text_response)
-            return response_model.model_validate_json(cleaned)
+        raise RuntimeError(
+            f"Auto Memory: all model candidates failed; last_error={last_error}"
+        ) from last_error
 
     def __init__(self):
         self.valves = self.Valves()
@@ -949,64 +905,6 @@ class Filter:
             )
 
         return messages
-
-    def get_restricted_user_valve(
-        self,
-        user_valve_value: Optional[ValveType],
-        admin_fallback: ValveType,
-        authorization_check: Optional[bool] = None,
-        valve_name: Optional[str] = None,
-    ) -> ValveType:
-        """
-        Get user valve value with security checks.
-
-        Args:
-            user_valve_value: The user's valve value to check
-            admin_fallback: Admin's fallback value
-            authorization_check: The valve value to check for authorization (e.g., user's API key)
-            valve_name: Name of the valve being checked (for logging)
-
-        Returns user's value only if:
-        1. authorization_check is provided and non-empty, OR
-        2. User is an admin, OR
-        3. Admin allows unsafe overrides
-
-        Otherwise returns admin fallback.
-        """
-        if authorization_check is None:
-            authorization_check = False
-
-        if authorization_check:
-            if user_valve_value is not None:
-                self.log(
-                    f"'{valve_name or 'unknown'}' override authorized (user has own API key)",
-                    level="debug",
-                )
-            return user_valve_value if user_valve_value is not None else admin_fallback
-
-        # Allow admins to override without providing their own API key
-        if hasattr(self, "current_user") and self.current_user.get("role") == "admin":
-            if user_valve_value is not None:
-                self.log(
-                    f"'{valve_name or 'unknown'}' override allowed for admin user",
-                    level="info",
-                )
-            return user_valve_value if user_valve_value is not None else admin_fallback
-
-        if self.valves.allow_unsafe_user_overrides:
-            if user_valve_value is not None:
-                self.log(
-                    f"'{valve_name or 'unknown'}' override allowed (unsafe overrides enabled)",
-                    level="warning",
-                )
-            return user_valve_value if user_valve_value is not None else admin_fallback
-
-        if user_valve_value is not None:
-            self.log(
-                f"'{valve_name or 'unknown'}' override blocked - user attempted override without authorization, using admin defaults for security",
-                level="warning",
-            )
-        return admin_fallback
 
     def build_memory_query(self, messages: list[dict[str, Any]]) -> str:
         """
@@ -1129,30 +1027,39 @@ class Filter:
     async def auto_memory(
         self,
         messages: list[dict[str, Any]],
+        request: Request,
         user: UserModel,
         emitter: Callable[[Any], Awaitable[None]],
+        *,
+        chat_model_id: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Execute the auto-memory extraction and update flow."""
-
-        if len(messages) < 2:
-            self.log("need at least 2 messages for context", level="debug")
-            return
-        self.log(f"flow started. user ID: {user.id}", level="debug")
-
-        related_memories = await self.get_related_memories(messages=messages, user=user)
-
-        stringified_memories = json.dumps(
-            [memory.model_dump(mode="json") for memory in related_memories]
-        )
-        conversation_str = self.messages_to_string(messages)
-
         try:
-            action_plan = await self.query_openai_sdk(
+            if len(messages) < 2:
+                self.log("need at least 2 messages for context", level="debug")
+                return
+            self.log(f"flow started. user ID: {user.id}", level="debug")
+
+            related_memories = await self.get_related_memories(
+                messages=messages, user=user
+            )
+
+            stringified_memories = json.dumps(
+                [memory.model_dump(mode="json") for memory in related_memories]
+            )
+            conversation_str = self.messages_to_string(messages)
+
+            action_plan = await self.query_task_model(
+                request=request,
+                user=user,
                 system_prompt=UNIFIED_SYSTEM_PROMPT,
                 user_message=f"Conversation snippet:\n{conversation_str}\n\nRelated Memories:\n{stringified_memories}",
                 response_model=build_actions_request_model(
                     [m.mem_id for m in related_memories]
                 ),
+                chat_model_id=chat_model_id,
+                metadata=metadata,
             )
             self.log(f"action plan: {action_plan}", level="debug")
 
@@ -1161,10 +1068,9 @@ class Filter:
                 user=user,
                 emitter=emitter,
             )
-
         except Exception as e:
             self.log(f"LLM query failed: {e}", level="error")
-            if self.user_valves.show_status:
+            if getattr(self, "user_valves", None) and self.user_valves.show_status:
                 await emit_status(
                     "memory processing failed", emitter=emitter, status="error"
                 )
@@ -1287,6 +1193,9 @@ class Filter:
         body: dict,
         __event_emitter__: Callable[[Any], Awaitable[None]],
         __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __metadata__: Optional[dict[str, Any]] = None,
+        __model__: Optional[dict[str, Any]] = None,
     ) -> dict:
 
         self.log("outlet invoked")
@@ -1301,7 +1210,6 @@ class Filter:
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
             raise ValueError("user not found")
-        self.current_user = __user__
 
         self.log(f"input user type = {type(__user__)}", level="debug")
         self.log(
@@ -1326,9 +1234,28 @@ class Filter:
             self.log("component was disabled by user, skipping", level="info")
             return body
 
-        _run_detached(
+        request = __request__ or Request(scope={"type": "http", "app": webui_app})
+        metadata = __metadata__
+        if metadata is None and hasattr(request, "state") and hasattr(request.state, "metadata"):
+            metadata = getattr(request.state, "metadata")
+        if isinstance(metadata, dict):
+            try:
+                request.state.metadata = metadata
+            except Exception:
+                pass
+
+        chat_model_id = body.get("model")
+        if not chat_model_id and isinstance(__model__, dict):
+            chat_model_id = __model__.get("id")
+
+        asyncio.create_task(
             self.auto_memory(
-                body.get("messages", []), user=user, emitter=__event_emitter__
+                body.get("messages", []),
+                request=request,
+                user=user,
+                emitter=__event_emitter__,
+                chat_model_id=cast(Optional[str], chat_model_id),
+                metadata=metadata if isinstance(metadata, dict) else None,
             )
         )
 
