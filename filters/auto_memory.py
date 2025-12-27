@@ -625,21 +625,17 @@ class Filter:
         logger = logging.getLogger()
         getattr(logger, level, logger.info)(message)
 
-    def messages_to_string(self, messages: list[dict[str, Any]]) -> str:
+    def messages_to_string(
+        self, messages: list[dict[str, Any]], *, messages_to_consider: int
+    ) -> str:
         stringified_messages: list[str] = []
 
-        effective_messages_to_consider = (
-            self.user_valves.messages_to_consider
-            if self.user_valves.messages_to_consider is not None
-            else self.valves.messages_to_consider
-        )
-
         self.log(
-            f"using last {effective_messages_to_consider} messages",
+            f"using last {messages_to_consider} messages",
             level="debug",
         )
 
-        for i in range(1, effective_messages_to_consider + 1):
+        for i in range(1, messages_to_consider + 1):
             if i > len(messages):
                 break
             try:
@@ -1029,6 +1025,7 @@ class Filter:
         messages: list[dict[str, Any]],
         request: Request,
         user: UserModel,
+        user_valves: "Filter.UserValves",
         emitter: Callable[[Any], Awaitable[None]],
         *,
         chat_model_id: Optional[str] = None,
@@ -1048,7 +1045,14 @@ class Filter:
             stringified_memories = json.dumps(
                 [memory.model_dump(mode="json") for memory in related_memories]
             )
-            conversation_str = self.messages_to_string(messages)
+            effective_messages_to_consider = (
+                user_valves.messages_to_consider
+                if user_valves.messages_to_consider is not None
+                else self.valves.messages_to_consider
+            )
+            conversation_str = self.messages_to_string(
+                messages, messages_to_consider=effective_messages_to_consider
+            )
 
             action_plan = await self.query_task_model(
                 request=request,
@@ -1066,11 +1070,12 @@ class Filter:
             await self.apply_memory_actions(
                 action_plan=action_plan,  # pyright: ignore[reportArgumentType]
                 user=user,
+                user_valves=user_valves,
                 emitter=emitter,
             )
         except Exception as e:
             self.log(f"LLM query failed: {e}", level="error")
-            if getattr(self, "user_valves", None) and self.user_valves.show_status:
+            if user_valves.show_status:
                 await emit_status(
                     "memory processing failed", emitter=emitter, status="error"
                 )
@@ -1080,6 +1085,7 @@ class Filter:
         self,
         action_plan: MemoryActionRequestStub,
         user: UserModel,
+        user_valves: "Filter.UserValves",
         emitter: Callable[[Any], Awaitable[None]],
     ) -> None:
         """
@@ -1162,7 +1168,7 @@ class Filter:
         status_message = ", ".join(status_parts)
         self.log(status_message or "no changes", level="info")
 
-        if status_message and self.user_valves.show_status:
+        if status_message and user_valves.show_status:
             await emit_status(status_message, emitter=emitter, status="complete")
 
     def inlet(
@@ -1224,13 +1230,19 @@ class Filter:
             )
             return body
 
-        self.user_valves = __user__.get("valves", self.UserValves())
-        if not isinstance(self.user_valves, self.UserValves):
+        raw_user_valves = __user__.get("valves")
+        if raw_user_valves is None:
+            user_valves = self.UserValves()
+        elif isinstance(raw_user_valves, self.UserValves):
+            user_valves = raw_user_valves
+        elif isinstance(raw_user_valves, dict):
+            user_valves = self.UserValves.model_validate(raw_user_valves)
+        else:
             raise ValueError("invalid user valves")
-        self.user_valves = cast(Filter.UserValves, self.user_valves)
-        self.log(f"user valves = {self.user_valves}", level="debug")
+        user_valves = cast(Filter.UserValves, user_valves)
+        self.log(f"user valves = {user_valves}", level="debug")
 
-        if not self.user_valves.enabled:
+        if not user_valves.enabled:
             self.log("component was disabled by user, skipping", level="info")
             return body
 
@@ -1253,6 +1265,7 @@ class Filter:
                 body.get("messages", []),
                 request=request,
                 user=user,
+                user_valves=user_valves,
                 emitter=__event_emitter__,
                 chat_model_id=cast(Optional[str], chat_model_id),
                 metadata=metadata if isinstance(metadata, dict) else None,
