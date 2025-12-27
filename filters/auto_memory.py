@@ -42,7 +42,7 @@ from open_webui.routers.memories import (
     update_memory_by_id,
 )
 from open_webui.utils.chat import generate_chat_completion
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
@@ -607,12 +607,19 @@ class Filter:
             description="whether to enable Auto Memory for this user",
         )
         show_status: bool = Field(
-            default=True, description="show status of the action."
+            default=False, description="show status of the action."
         )
         messages_to_consider: Optional[int] = Field(
             default=None,
             description="override for number of recent messages to consider (falls back to global if null). includes assistant responses.",
         )
+
+        @field_validator("messages_to_consider", mode="before")
+        @classmethod
+        def _coerce_blank_messages_to_consider(cls, v: Any) -> Any:
+            if isinstance(v, str) and v.strip() == "":
+                return None
+            return v
 
     def log(self, message: str, level: LogLevel = "info"):
         if level == "debug" and not self.valves.debug_mode:
