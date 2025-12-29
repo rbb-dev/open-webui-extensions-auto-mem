@@ -609,17 +609,10 @@ class Filter:
         show_status: bool = Field(
             default=False, description="show status of the action."
         )
-        messages_to_consider: Optional[int] = Field(
-            default=None,
-            description="override for number of recent messages to consider (falls back to global if null). includes assistant responses.",
+        messages_to_consider: int = Field(
+            default=0,
+            description="override for number of recent messages to consider (0 = use global setting). includes assistant responses.",
         )
-
-        @field_validator("messages_to_consider", mode="before")
-        @classmethod
-        def _coerce_blank_messages_to_consider(cls, v: Any) -> Any:
-            if isinstance(v, str) and v.strip() == "":
-                return None
-            return v
 
     def log(self, message: str, level: LogLevel = "info"):
         if level == "debug" and not self.valves.debug_mode:
@@ -1099,7 +1092,7 @@ class Filter:
             )
             effective_messages_to_consider = (
                 user_valves.messages_to_consider
-                if user_valves.messages_to_consider is not None
+                if user_valves.messages_to_consider > 0
                 else self.valves.messages_to_consider
             )
             conversation_str = self.messages_to_string(
